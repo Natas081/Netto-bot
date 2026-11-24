@@ -12,9 +12,9 @@
     </parent>
 
     <groupId>com.linkguard</groupId>
-    <artifactId>linkguard-bot</artifactId>
+    <artifactId>netto-bot</artifactId>
     <version>0.0.1-SNAPSHOT</version>
-    <name>LinkGuard Bot</name>
+    <name>Netto</name>
 
     <properties>
         <java.version>21</java.version>
