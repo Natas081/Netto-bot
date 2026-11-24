@@ -6,6 +6,7 @@ import com.linkguard.dto.ScanStats;
 import com.linkguard.dto.VirusTotalReport;
 import com.linkguard.service.LinkAnalysisService;
 import com.linkguard.service.LinkClassificationService;
+import com.linkguard.service.SecurityTipService;
 import com.linkguard.service.UrlValidationService;
 import java.time.Instant;
 import java.util.Optional;
@@ -27,9 +28,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-@WebMvcTest(ChatController.class)
+@WebMvcTest({ChatController.class, SecurityTipController.class})
 @Import({LinkAnalysisService.class, LinkClassificationService.class, UrlValidationService.class,
-        VirusTotalConfig.class})
+        SecurityTipService.class, VirusTotalConfig.class})
 class ChatControllerTest {
 
     @Autowired
@@ -89,4 +90,14 @@ class ChatControllerTest {
         verifyNoInteractions(client);
     }
 
+    @Test
+    void randomTipsAreServedFromTheBackendWithoutCaching() throws Exception {
+        mvc.perform(get("/api/tips/random"))
+                .andExpect(status().isOk())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
+                .andExpect(header().string("Cache-Control", "no-store"))
+                .andExpect(jsonPath("$.tip").isString())
+                .andExpect(jsonPath("$.tip").isNotEmpty());
+        verifyNoInteractions(client);
+    }
 }
