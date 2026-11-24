@@ -1,3 +1,14 @@
 /target/
 /.idea/
 *.iml
+/.vscode/
+.env
+.env.*
+!.env.example
+application-local.*
+application-secrets.*
+*.log
+*.pem
+*.key
+*.p12
+*.jks

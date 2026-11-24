@@ -1,82 +1,158 @@
 package com.linkguard.service;
 
+import com.linkguard.client.VirusTotalClient;
+import com.linkguard.config.VirusTotalProperties;
 import com.linkguard.dto.ChatResponse;
 import com.linkguard.dto.ChatResponse.Status;
-import java.net.IDN;
+import com.linkguard.dto.VirusTotalAnalysis;
+import com.linkguard.dto.VirusTotalReport;
+import com.linkguard.exception.VirusTotalException;
 import java.net.URI;
-import java.net.URISyntaxException;
-import java.util.List;
-import java.util.Locale;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
 import org.springframework.stereotype.Service;
 
 @Service
 public class LinkAnalysisService {
 
-    private static final int MAX_MESSAGE_LENGTH = 2048;
-    private static final String INVALID_LINK = "Envie um link HTTP ou HTTPS válido, como https://exemplo.com.";
-    private static final List<Status> SIMULATED_STATUSES = List.of(Status.CONFIÁVEL, Status.SUSPEITO, Status.PERIGOSO);
+    private final UrlValidationService validator;
+    private final VirusTotalClient client;
+    private final LinkClassificationService classifier;
+    private final VirusTotalProperties properties;
+    private final Clock clock;
+    private final Map<String, Entry> cache = new LinkedHashMap<>();
 
-    public ChatResponse analyze(String message) {
-        if (message != null && message.length() > MAX_MESSAGE_LENGTH) {
-            return ChatResponse.invalid("O link pode ter até 2.048 caracteres.");
-        }
-
-        String link = message == null ? "" : message.strip();
-        if (link.isEmpty()) {
-            return ChatResponse.invalid("Digite ou cole um link para iniciar a simulação.");
-        }
-        if (!isHttpLink(link)) {
-            return ChatResponse.invalid(INVALID_LINK);
-        }
-
-        Status status = classify(link.toLowerCase(Locale.ROOT));
-        String reply = switch (status) {
-            case CONFIÁVEL -> "Este link foi classificado como confiável na simulação.";
-            case SUSPEITO -> "Atenção! Este link foi classificado como suspeito na simulação.";
-            case PERIGOSO -> "Alerta! Este link foi classificado como perigoso na simulação. Evite acessá-lo.";
-            case INVALIDO -> throw new IllegalStateException("A classificação simulada exige uma URL válida.");
-        };
-        return new ChatResponse(status, reply);
+    public LinkAnalysisService(UrlValidationService validator, VirusTotalClient client,
+                               LinkClassificationService classifier, VirusTotalProperties properties, Clock clock) {
+        this.validator = validator;
+        this.client = client;
+        this.classifier = classifier;
+        this.properties = properties;
+        this.clock = clock;
     }
 
-    private boolean isHttpLink(String link) {
+    // One lock coalesces simultaneous submissions and polling in this in-memory prototype.
+    public synchronized ChatResponse analyze(String message) {
+        URI url = validator.validate(message);
+        String key = url.toASCIIString();
+        pruneCache();
+        Entry existing = cache.get(key);
+        if (existing != null) return existing.response;
+
+        evictCompletedEntryIfFull();
+        if (cache.size() >= properties.cacheMaxEntries()) {
+            return ChatResponse.inconclusive(url.getHost(), "Há muitas verificações em andamento. Tente novamente mais tarde.");
+        }
+        Entry entry = new Entry(url, clock.instant());
         try {
-            URI uri = new URI(link);
-            String scheme = uri.getScheme();
-            if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) {
-                return false;
+            Optional<VirusTotalReport> report = client.getReport(url);
+            if (report.isPresent() && isFresh(report.get())) {
+                entry.finish(classifier.classify(url.getHost(), report.get()), properties.cacheTtl(), clock.instant());
+            } else {
+                entry.providerAnalysisId = client.submit(url);
+                entry.nextPollAt = clock.instant().plus(properties.pollInterval());
+                entry.expiresAt = clock.instant().plus(properties.analysisTimeout()).plusSeconds(60);
+                entry.response = pending(entry);
             }
-            URI server = withAsciiHost(uri);
-            return server.getHost() != null && server.getPort() <= 65535;
-        } catch (URISyntaxException | IllegalArgumentException ex) {
-            return false;
+        } catch (VirusTotalException ex) {
+            entry.finish(failure(url.getHost(), ex), Duration.ofMinutes(1), clock.instant());
+        }
+        cache.put(key, entry);
+        return entry.response;
+    }
+
+    public synchronized ChatResponse poll(UUID analysisId) {
+        Entry entry = cache.values().stream().filter(item -> item.ticket.equals(analysisId)).findFirst().orElse(null);
+        if (entry == null || !clock.instant().isBefore(entry.expiresAt)) {
+            return ChatResponse.inconclusive(null, "Esta verificação expirou. Envie o link novamente para consultar um relatório atualizado.");
+        }
+        if (entry.response.status() != Status.EM_ANALISE) return entry.response;
+        Instant now = clock.instant();
+        if (!now.isBefore(entry.createdAt.plus(properties.analysisTimeout())) || entry.polls >= properties.maxPolls()) {
+            entry.finish(ChatResponse.inconclusive(entry.url.getHost(),
+                    "O VirusTotal ainda não concluiu a verificação dentro do tempo de acompanhamento. Isso não significa que o link seja seguro. Tente novamente mais tarde."),
+                    Duration.ofMinutes(1), now);
+            return entry.response;
+        }
+        if (now.isBefore(entry.nextPollAt)) return pending(entry);
+
+        entry.polls++;
+        try {
+            VirusTotalAnalysis analysis = client.getAnalysis(entry.providerAnalysisId);
+            if (analysis.completed()) {
+                entry.finish(classifier.classify(entry.url.getHost(), analysis.report()), properties.cacheTtl(), clock.instant());
+            } else {
+                entry.nextPollAt = clock.instant().plus(properties.pollInterval());
+                entry.response = pending(entry);
+            }
+        } catch (VirusTotalException ex) {
+            entry.finish(failure(entry.url.getHost(), ex), Duration.ofMinutes(1), clock.instant());
+        }
+        return entry.response;
+    }
+
+    private boolean isFresh(VirusTotalReport report) {
+        return report.stats() != null && report.stats().hasVerdicts() && report.analyzedAt() != null
+                && report.analyzedAt().isAfter(clock.instant().minus(properties.reportMaxAge()));
+    }
+
+    private ChatResponse pending(Entry entry) {
+        long seconds = Math.max(1, Duration.between(clock.instant(), entry.nextPollAt).toSeconds() + 1);
+        return new ChatResponse(Status.EM_ANALISE,
+                "Estou analisando este link. Aguarde alguns instantes enquanto consulto os mecanismos de segurança.",
+                entry.url.getHost(), null, null, "VirusTotal", entry.ticket, (int) seconds);
+    }
+
+    private ChatResponse failure(String domain, VirusTotalException ex) {
+        String reason = switch (ex.reason()) {
+            case NOT_CONFIGURED -> "A chave VIRUSTOTAL_API_KEY ainda não foi configurada no servidor.";
+            case UNAUTHORIZED -> "O VirusTotal não autorizou a consulta. Revise a chave e as permissões da conta no servidor.";
+            case RATE_LIMIT -> "O limite de consultas ao VirusTotal foi atingido. Tente novamente mais tarde.";
+            case UNAVAILABLE, INVALID_RESPONSE -> "Não consegui verificar a segurança deste link no momento. Tente novamente mais tarde.";
+        };
+        return ChatResponse.inconclusive(domain, reason + " Isso não significa que o link seja seguro.");
+    }
+
+    private void pruneCache() {
+        Instant now = clock.instant();
+        Iterator<Entry> entries = cache.values().iterator();
+        while (entries.hasNext()) {
+            Entry entry = entries.next();
+            if (!now.isBefore(entry.expiresAt)) entries.remove();
         }
     }
 
-    private URI withAsciiHost(URI uri) throws URISyntaxException {
-        String authority = uri.getRawAuthority();
-        if (uri.getHost() != null || authority == null || authority.chars().allMatch(c -> c < 128)) {
-            return uri;
+    private void evictCompletedEntryIfFull() {
+        if (cache.size() >= properties.cacheMaxEntries()) {
+            cache.values().stream().filter(item -> item.response.status() != Status.EM_ANALISE)
+                    .findFirst().ifPresent(item -> cache.remove(item.url.toASCIIString()));
         }
-
-        int hostStart = authority.lastIndexOf('@') + 1;
-        int portStart = authority.indexOf(':', hostStart);
-        int hostEnd = portStart == -1 ? authority.length() : portStart;
-        String host = IDN.toASCII(authority.substring(hostStart, hostEnd), IDN.USE_STD3_ASCII_RULES);
-        return new URI(uri.getScheme() + "://" + authority.substring(0, hostStart)
-                + host + authority.substring(hostEnd)).parseServerAuthority();
     }
 
-    private Status classify(String link) {
-        if (link.contains("perigoso")) {
-            return Status.PERIGOSO;
+    private static class Entry {
+        final URI url;
+        final UUID ticket = UUID.randomUUID();
+        final Instant createdAt;
+        Instant expiresAt;
+        Instant nextPollAt;
+        String providerAnalysisId;
+        int polls;
+        ChatResponse response;
+
+        Entry(URI url, Instant now) {
+            this.url = url;
+            this.createdAt = now;
         }
-        if (link.contains("suspeito")) {
-            return Status.SUSPEITO;
+
+        void finish(ChatResponse result, Duration ttl, Instant now) {
+            response = result;
+            expiresAt = now.plus(ttl);
         }
-        if (link.contains("seguro")) {
-            return Status.CONFIÁVEL;
-        }
-        return SIMULATED_STATUSES.get(Math.floorMod(link.hashCode(), SIMULATED_STATUSES.size()));
     }
 }
